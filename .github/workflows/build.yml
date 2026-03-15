@@ -1,0 +1,144 @@
+name: Build DNF 2001 Vita VPK
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: vitasdk/vitasdk:latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Install build dependencies
+        run: |
+          apk add --no-cache bash git make python3 gcc g++ cmake zip p7zip
+          vdpm libogg
+          vdpm libvorbis
+          vdpm flac
+          vdpm SDL2
+          vdpm SDL_mixer
+          vdpm SDL2_mixer
+
+      - name: Clone EDuke32-Vita
+        run: |
+          git clone --depth 1 https://github.com/Rinnegatamante/EDuke32-Vita.git build_eduke32
+
+      - name: Patch source for standalone DNF 2001
+        run: |
+          cd build_eduke32
+
+          echo "=== Patching psp2_main in sdlayer.cpp ==="
+          python3 ../scripts/patch_sdlayer.py source/build/src/sdlayer.cpp
+
+          echo "=== Patching videoSetMode to bypass SDL_SetVideoMode on PSP2 (sdlayer + sdlayer12) ==="
+          python3 ../scripts/patch_videomode.py source/build/src/sdlayer.cpp source/build/src/sdlayer12.cpp source/duke3d/src/config.cpp
+
+
+          echo "=== Applying performance optimizations ==="
+          python3 ../scripts/patch_performance.py source/build/src/sdlayer.cpp
+
+          echo "=== Patching controls (config-level axis mapping for FPS layout) ==="
+          python3 ../scripts/patch_controls.py source/duke3d/src/_functio.h source/duke3d/src/config.cpp
+
+          echo "=== Reducing sound load for performance ==="
+          # Reduce sound voices from 64 to 16 and sample rate from 48000 to 22050
+          sed -i 's/MAXVOICES  = 64/MAXVOICES  = 16/g; s/MAXVOICES = 64/MAXVOICES = 16/g' source/duke3d/src/sounds.cpp source/duke3d/src/sounds_common.cpp source/build/include/sounds_common.h 2>/dev/null || true
+          sed -i 's/48000/22050/g' source/duke3d/src/sounds.cpp source/build/src/sdlayer.cpp 2>/dev/null || true
+          # Reduce number of simultaneous channels
+          sed -i 's/MIX_CHANNELS  = 64/MIX_CHANNELS  = 8/g; s/MIX_CHANNELS = 64/MIX_CHANNELS = 8/g; s/#define MAXCHANNELS 64/#define MAXCHANNELS 8/g' source/duke3d/src/sounds.cpp source/duke3d/src/sounds_common.cpp 2>/dev/null || true
+          # Reduce engine cache from 96MB to 32MB (less memory pressure)
+          sed -i 's/MAXCACHE1DSIZE (96\*1024\*1024)/MAXCACHE1DSIZE (32*1024*1024)/g; s/96\*1024\*1024/32*1024*1024/g' source/build/include/cache1d.h source/build/src/cache1d.cpp 2>/dev/null || true
+
+          echo "=== Patching data paths ==="
+          # Change log path
+          sed -i 's|OSD_SetLogFile("ux0:data/EDuke32/eduke32.log");|OSD_SetLogFile("ux0:data/DNF/dnf2001.log");|g' source/duke3d/src/game.cpp
+
+
+          # Change all EDuke32 data paths to DNF
+          find source/ \( -name "*.cpp" -o -name "*.c" -o -name "*.h" \) -exec \
+            sed -i 's|ux0:data/EDuke32|ux0:data/DNF|g' {} \;
+          
+          # Change thread name
+          sed -i 's|sceKernelCreateThread("EDuke32"|sceKernelCreateThread("DNF2001"|g' source/build/src/sdlayer.cpp
+
+          echo "=== Fixing static linking order in GNUmakefile ==="
+          # SDL_mixer depends on FLAC, vorbis, ogg - these must come AFTER -lSDL_mixer for static linking
+          # The original Makefile has them BEFORE SDL_mixer and is missing -lFLAC entirely
+          sed -i 's|-lSDL_mixer -lSDL -lmikmod -lspeexdsp|-lSDL_mixer -lFLAC -lvorbisfile -lvorbis -logg -lSDL -lmikmod -lspeexdsp|g' GNUmakefile
+
+      - name: Build EDuke32 for Vita
+        run: |
+          cd build_eduke32
+          export PKG_CONFIG_PATH=$VITASDK/arm-vita-eabi/lib/pkgconfig:$PKG_CONFIG_PATH
+
+          # DNF_VITA_PERFORMANCE: Remove debug symbols flag for release perf
+          sed -i 's/-mcpu=cortex-a9 -g -ffast-math/-mcpu=cortex-a9 -ffast-math/g' Common.mak
+
+          make -j$(nproc) PLATFORM=PSP2 RELEASE=1 USE_OPENGL=0 POLYMER=0 NETCODE=0 \
+            HAVE_GTK2=0 STARTUP_WINDOW=0 USE_LIBVPX=0 LUNATIC=0 SIMPLE_MENU=1 \
+            OPTLEVEL=3
+
+      - name: Package VPK
+        run: |
+          cd build_eduke32
+
+          # Find the ELF
+          ELF_FILE=$(find . -maxdepth 1 -name "*.elf" | head -1)
+          if [ -z "$ELF_FILE" ]; then
+            echo "ERROR: No ELF file found!"
+            ls -la
+            exit 1
+          fi
+          echo "Found ELF: $ELF_FILE"
+
+          # Create VELF and EBOOT
+          vita-elf-create "$ELF_FILE" dnf2001.velf
+          vita-make-fself -s dnf2001.velf eboot.bin
+          vita-mksfoex -s TITLE_ID="DNF200100" -d ATTRIBUTE2=12 "DNF 2001 Vita" param.sfo
+
+          # Setup VPK structure
+          mkdir -p vpk/sce_sys/livearea/contents
+          cp eboot.bin vpk/
+          cp param.sfo vpk/sce_sys/
+
+          # Copy assets from project
+          cp ../vita_assets/icon0.png vpk/sce_sys/icon0.png 2>/dev/null || \
+            python3 ../scripts/gen_icon.py vpk/sce_sys/icon0.png
+          cp ../vita_assets/livearea/contents/template.xml vpk/sce_sys/livearea/contents/ 2>/dev/null || \
+            cp ../vita_livearea/template.xml vpk/sce_sys/livearea/contents/
+          cp ../vita_assets/livearea/contents/bg.png vpk/sce_sys/livearea/contents/ 2>/dev/null || \
+            python3 ../scripts/gen_bg.py vpk/sce_sys/livearea/contents/bg.png
+          cp ../vita_assets/livearea/contents/startup.png vpk/sce_sys/livearea/contents/ 2>/dev/null || \
+            python3 ../scripts/gen_startup.py vpk/sce_sys/livearea/contents/startup.png
+
+          # Pack VPK - include config files for data directory
+          cd vpk
+          mkdir -p data
+          cp ../../dnf_controls.cfg data/
+          cp ../../AUTOEXEC.CFG data/
+          vita-pack-vpk -s sce_sys/param.sfo -b eboot.bin \
+            -a sce_sys/icon0.png=sce_sys/icon0.png \
+            -a sce_sys/livearea/contents/template.xml=sce_sys/livearea/contents/template.xml \
+            -a sce_sys/livearea/contents/bg.png=sce_sys/livearea/contents/bg.png \
+            -a sce_sys/livearea/contents/startup.png=sce_sys/livearea/contents/startup.png \
+            -a data/dnf_controls.cfg=data/dnf_controls.cfg \
+            -a data/AUTOEXEC.CFG=data/AUTOEXEC.CFG \
+            ../../DNF2001_Vita.vpk
+
+      - name: Upload VPK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DNF2001_Vita
+          path: DNF2001_Vita.vpk
+          if-no-files-found: error
